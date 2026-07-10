@@ -1892,6 +1892,7 @@ dependencies = [
  "serde-with-expand-env",
  "serde_json",
  "serde_yaml",
+ "shellexpand 2.1.2",
  "tempfile",
  "tokio",
  "uhlc 0.5.2",

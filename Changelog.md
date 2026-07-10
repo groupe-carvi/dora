@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add canonicalized, allowlisted `module_roots` with explicit `@root/path` shared module references, including nested-module containment checks.
+- Add strict `${_param.name}` expansion in module args and string environment values while preserving `PARAM_<KEY>` compatibility.
+
 ## 0.1.0 (2026-03-13)
 
 First official release of Dora (AI-Dora) -- a 100% Rust framework for building real-time robotics and AI applications.

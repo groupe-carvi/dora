@@ -103,6 +103,23 @@ nodes:
       - result
 ```
 
+## Trusted shared module roots
+
+A dataflow may explicitly allow reusable modules outside its project directory with a root allowlist. Root paths are resolved relative to the dataflow file (or may be absolute), canonicalized, and checked again after symlink resolution. A module must opt in with the distinct `@root/path` reference syntax; ordinary `module:` paths remain project-relative and may not contain `..`.
+
+```yaml
+module_roots:
+  shared: ../servo-modules
+
+nodes:
+  - id: servo
+    module: '@shared/servo.module.yml'
+    params:
+      auto_arm: "true"
+```
+
+Root names are exact YAML map keys. Absolute or unlisted `@` references, traversal components, missing roots, and symlink escapes fail with an actionable diagnostic. Nested modules may use the same `@root/path` syntax and are subject to the same allowlist.
+
 ## Using Modules
 
 Reference a module in a dataflow node using the `module:` field instead of `path:`:
@@ -143,7 +160,15 @@ nodes:
       - result
 ```
 
-Parameters are also injected as environment variables (`PARAM_SPEED`, `PARAM_MODE`) into every node inside the module.
+Parameters are also injected as environment variables (`PARAM_SPEED`, `PARAM_MODE`) into every node inside the module. To intentionally set a real environment key, use the same explicit parameter expression syntax in a module node's string `env` value:
+
+```yaml
+env:
+  SERVO_AUTO_ARM: "${_param.auto_arm}"
+  SERVO_PROFILE: "servo-${_param.profile}"
+```
+
+Only declared `params` are expanded; inherited host environment variables are never consulted for `${_param...}`. Missing parameters and malformed expressions fail expansion. Boolean, integer, and float `env` values remain typed and literal. The compatibility `PARAM_<KEY>` injection is retained.
 
 ## Expansion Rules
 

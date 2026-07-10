@@ -37,6 +37,7 @@ nodes:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `nodes` | list | **required** | List of node configurations |
+| `module_roots` | map | `{}` | Explicit trusted roots for `@root/path` shared module references |
 | `strict_types` | bool | `false` | Treat type warnings as errors in `validate` and `build` |
 | `type_rules` | list | `[]` | User-defined type compatibility rules (see [Type Annotations](types.md#user-defined-compatibility-rules)) |
 | `health_check_interval` | float | `5.0` | Seconds between daemon health check sweeps. For each node with `health_check_timeout` set, the daemon checks whether the node has communicated within its timeout; if not, the node is killed and its `restart_policy` is evaluated |
@@ -219,7 +220,7 @@ env:
     __dora_env: HOST_VAR   # read from host environment at runtime
 ```
 
-Environment variables apply to both `build` commands and node execution. Values support `$VAR` expansion syntax.
+Environment variables apply to both `build` commands and node execution. Values support `$VAR` expansion syntax. Module nodes additionally support explicit `${_param.name}` substitution for declared module params; see [Modules Guide](modules.md#parameters).
 
 ### Logging
 

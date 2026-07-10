@@ -95,6 +95,7 @@ pub mod bench_support {
             strict_types: None,
             type_rules: vec![],
             env: None,
+            module_roots: Default::default(),
         };
         let mut df = RunningDataflow::new(Uuid::nil(), DaemonId::new(None), descriptor);
 
@@ -4391,6 +4392,7 @@ mod fault_tolerance_tests {
             strict_types: None,
             type_rules: vec![],
             env: None,
+            module_roots: Default::default(),
         };
         RunningDataflow::new(Uuid::nil(), DaemonId::new(None), descriptor)
     }

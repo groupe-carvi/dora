@@ -5,7 +5,7 @@ use crate::{
     id::{DataId, NodeId, OperatorId},
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
 use serde_with_expand_env::with_expand_envs;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -149,6 +149,11 @@ pub struct Descriptor {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, EnvValue>>,
+
+    /// Trusted roots for reusable modules referenced with `@root/path`.
+    /// Paths are resolved relative to this descriptor and canonicalized before use.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub module_roots: BTreeMap<String, PathBuf>,
 }
 
 /// A type compatibility rule declared in the dataflow YAML.
@@ -1104,6 +1109,21 @@ pub enum GitRepoRev {
     Rev(String),
 }
 
+fn deserialize_env_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    // Keep parameter expressions literal through YAML parsing; module expansion
+    // resolves them against the declared params, never against host env.
+    if value.contains("${_param.") {
+        return Ok(value);
+    }
+    shellexpand::env(&value)
+        .map(|expanded| expanded.into_owned())
+        .map_err(D::Error::custom)
+}
+
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -1114,7 +1134,7 @@ pub enum EnvValue {
     Integer(i64),
     #[serde(deserialize_with = "with_expand_envs")]
     Float(f64),
-    #[serde(deserialize_with = "with_expand_envs")]
+    #[serde(deserialize_with = "deserialize_env_string")]
     String(String),
 }
 

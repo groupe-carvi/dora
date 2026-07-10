@@ -101,8 +101,14 @@ pub fn expand_modules_with_boundaries(
 
     for node in &descriptor.nodes {
         if node.module.is_some() {
-            let (expanded, omap) =
-                expand_module_node(node, base_dir, &canonical_base, 0, &mut seen)?;
+            let (expanded, omap) = expand_module_node(
+                node,
+                base_dir,
+                &canonical_base,
+                &descriptor.module_roots,
+                0,
+                &mut seen,
+            )?;
             let module_id = node.id.to_string();
             output_maps.insert(module_id.clone(), omap);
             let node_ids: Vec<String> = expanded.iter().map(|n| n.id.to_string()).collect();
@@ -137,6 +143,7 @@ pub fn expand_modules_with_boundaries(
             strict_types: descriptor.strict_types,
             type_rules: descriptor.type_rules.clone(),
             env: descriptor.env.clone(),
+            module_roots: descriptor.module_roots.clone(),
         },
         boundaries,
     })
@@ -248,6 +255,77 @@ pub fn check_module_file(module_path: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+fn resolve_module_path(
+    reference: &str,
+    base_dir: &Path,
+    canonical_base: &Path,
+    module_roots: &BTreeMap<String, PathBuf>,
+    node_id: &str,
+) -> eyre::Result<(PathBuf, PathBuf)> {
+    let (candidate, containment, description) = if let Some(rest) = reference.strip_prefix('@') {
+        let (root_name, relative) = rest.split_once('/').ok_or_else(|| eyre::eyre!(
+            "invalid shared module reference `{reference}` (node `{node_id}`); use `@root/path/to/module.yml`"
+        ))?;
+        if root_name.is_empty()
+            || relative.is_empty()
+            || is_absolute_any_platform(relative)
+            || relative.split('/').any(|part| part == "..")
+            || relative.split('\\').any(|part| part == "..")
+        {
+            bail!(
+                "shared module reference `{reference}` (node `{node_id}`) must contain only a root name and a relative path without `..`"
+            );
+        }
+        let root = module_roots.get(root_name).ok_or_else(|| eyre::eyre!(
+            "shared module root `{root_name}` is not declared; add `module_roots: {root_name}: <directory>` to the top-level descriptor"
+        ))?;
+        let root_path = if root.is_absolute() {
+            root.clone()
+        } else {
+            base_dir.join(root)
+        };
+        let root_canonical = root_path.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve module root `{root_name}`: {}",
+                root_path.display()
+            )
+        })?;
+        (
+            root_canonical.join(relative),
+            root_canonical,
+            format!("shared root `{root_name}`"),
+        )
+    } else {
+        if is_absolute_any_platform(reference) {
+            bail!(
+                "module path `{reference}` must be relative (node `{node_id}`); use an explicit `@root/path` reference for trusted shared modules"
+            );
+        }
+        if reference.split('/').any(|part| part == "..")
+            || reference.split('\\').any(|part| part == "..")
+        {
+            bail!(
+                "module path `{reference}` escapes the project directory (node `{node_id}`); use an explicit `@root/path` reference for trusted shared modules"
+            );
+        }
+        (
+            base_dir.join(reference),
+            canonical_base.to_path_buf(),
+            "project directory".to_string(),
+        )
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("module file not found: {}", candidate.display()))?;
+    if !canonical.starts_with(&containment) {
+        bail!(
+            "module path `{reference}` (node `{node_id}`) escapes {description}; canonical path is `{}`",
+            canonical.display()
+        );
+    }
+    Ok((candidate, canonical))
+}
+
 /// Expand a single module node into its constituent flat nodes.
 ///
 /// Returns `(expanded_nodes, output_map)` where output_map maps each declared
@@ -256,6 +334,7 @@ fn expand_module_node(
     node: &Node,
     base_dir: &Path,
     canonical_base: &Path,
+    module_roots: &BTreeMap<String, PathBuf>,
     depth: u8,
     seen: &mut HashSet<PathBuf>,
 ) -> eyre::Result<(Vec<Node>, BTreeMap<String, String>)> {
@@ -272,27 +351,13 @@ fn expand_module_node(
         .as_ref()
         .expect("expand_module_node called on non-module node");
 
-    // Security: reject absolute paths and path traversal
-    if is_absolute_any_platform(module_path_str) {
-        bail!(
-            "module path `{}` must be relative (node `{}`)",
-            module_path_str,
-            node.id
-        );
-    }
-
-    let module_path = base_dir.join(module_path_str);
-    let canonical = module_path
-        .canonicalize()
-        .with_context(|| format!("module file not found: {}", module_path.display()))?;
-
-    if !canonical.starts_with(canonical_base) {
-        bail!(
-            "module path `{}` escapes the project directory (node `{}`)",
-            module_path_str,
-            node.id
-        );
-    }
+    let (module_path, canonical) = resolve_module_path(
+        module_path_str,
+        base_dir,
+        canonical_base,
+        module_roots,
+        node.id.as_ref(),
+    )?;
 
     if !seen.insert(canonical.clone()) {
         bail!(
@@ -382,16 +447,49 @@ fn expand_module_node(
             && !Path::new(path).is_absolute()
         {
             let resolved = module_dir.join(path);
-            let relative = resolved.strip_prefix(canonical_base).map_err(|_| {
-                eyre::eyre!(
-                    "module node `{}` path `{}` resolves outside the project \
-                         directory (resolved to `{}`)",
-                    inner_node.id,
-                    path,
-                    resolved.display()
-                )
-            })?;
-            inner_node.path = Some(relative.to_string_lossy().into_owned());
+            if let Ok(relative) = resolved.strip_prefix(canonical_base) {
+                inner_node.path = Some(relative.to_string_lossy().into_owned());
+            } else {
+                let allowed_shared_root = module_roots.values().any(|root| {
+                    let root_path = if root.is_absolute() {
+                        root.clone()
+                    } else {
+                        base_dir.join(root)
+                    };
+                    root_path
+                        .canonicalize()
+                        .is_ok_and(|root| module_dir.starts_with(root))
+                });
+                if !allowed_shared_root {
+                    return Err(eyre::eyre!(
+                        "module node `{}` path `{}` resolves outside the project directory (resolved to `{}`)",
+                        inner_node.id,
+                        path,
+                        resolved.display()
+                    ));
+                }
+                let canonical_path = resolved.canonicalize().map_err(|_| eyre::eyre!(
+                    "module node `{}` path `{}` does not resolve to an existing file under its trusted module root",
+                    inner_node.id, path
+                ))?;
+                if !module_roots.values().any(|root| {
+                    let root_path = if root.is_absolute() {
+                        root.clone()
+                    } else {
+                        base_dir.join(root)
+                    };
+                    root_path
+                        .canonicalize()
+                        .is_ok_and(|root| canonical_path.starts_with(root))
+                }) {
+                    return Err(eyre::eyre!(
+                        "module node `{}` path `{}` escapes its trusted module root",
+                        inner_node.id,
+                        path
+                    ));
+                }
+                inner_node.path = Some(canonical_path.to_string_lossy().into_owned());
+            }
         }
 
         // Propagate deploy from module node to inner nodes
@@ -399,9 +497,11 @@ fn expand_module_node(
             inner_node.deploy = node.deploy.clone();
         }
 
-        // Substitute params in env values
+        // Substitute params in args and explicitly declared env values.
         if !params.is_empty() {
-            substitute_params_in_node(&mut inner_node, params);
+            substitute_params_in_node(&mut inner_node, params)?;
+        } else {
+            validate_no_param_expressions(&inner_node)?;
         }
 
         // Prepend module-level build command to inner node builds
@@ -424,8 +524,14 @@ fn expand_module_node(
     for inner_node in prefixed_nodes {
         if inner_node.module.is_some() {
             let nested_id = inner_node.id.to_string();
-            let (nested, nested_omap) =
-                expand_module_node(&inner_node, module_dir, canonical_base, depth + 1, seen)?;
+            let (nested, nested_omap) = expand_module_node(
+                &inner_node,
+                module_dir,
+                canonical_base,
+                module_roots,
+                depth + 1,
+                seen,
+            )?;
             nested_output_maps.insert(nested_id, nested_omap);
             final_nodes.extend(nested);
         } else {
@@ -461,31 +567,90 @@ fn expand_module_node(
     Ok((final_nodes, output_map))
 }
 
-/// Substitute `${_param.name}` references in a node's args and inject params
-/// into the node's env map as `EnvValue::String` entries.
-fn substitute_params_in_node(node: &mut Node, params: &BTreeMap<String, String>) {
-    // Substitute in args
+/// Substitute `${_param.name}` references in args and string env values.
+///
+/// Only declared module params are eligible; host environment variables are never
+/// consulted here. Non-string EnvValue variants are preserved exactly.
+fn substitute_params_in_node(
+    node: &mut Node,
+    params: &BTreeMap<String, String>,
+) -> eyre::Result<()> {
     if let Some(ref mut args) = node.args {
-        *args = substitute_params_in_str(args, params);
+        *args = substitute_params_in_str(args, params)?;
+    }
+    if let Some(env) = node.env.as_mut() {
+        for (key, value) in env.iter_mut() {
+            if let EnvValue::String(value) = value {
+                *value = substitute_params_in_str(value, params).map_err(|error| {
+                    eyre::eyre!(
+                        "invalid parameter expression in env key `{key}` of node `{}`: {error}",
+                        node.id
+                    )
+                })?;
+            }
+        }
     }
 
-    // Inject params into env map (caller params override inner defaults)
+    // Preserve the established PARAM_<KEY> injection behavior;
+    // explicit declaration in the module.
     let env = node.env.get_or_insert_with(BTreeMap::new);
     for (key, value) in params {
-        env.insert(
-            format!("PARAM_{}", key.to_uppercase()),
-            EnvValue::String(value.clone()),
-        );
+        let env_key = format!("PARAM_{}", key.to_uppercase());
+        let injected = EnvValue::String(value.clone());
+        // Keep the established compatibility behavior: the module parameter
+        // injection wins over an inner PARAM_* default.
+        env.insert(env_key, injected);
     }
+    Ok(())
 }
 
-fn substitute_params_in_str(s: &str, params: &BTreeMap<String, String>) -> String {
-    let mut result = s.to_string();
-    for (key, value) in params {
-        let pattern = format!("${{_param.{key}}}");
-        result = result.replace(&pattern, value);
+fn validate_no_param_expressions(node: &Node) -> eyre::Result<()> {
+    if let Some(args) = &node.args {
+        let empty = BTreeMap::new();
+        let _ = substitute_params_in_str(args, &empty)?;
     }
-    result
+    if let Some(env) = &node.env {
+        let empty = BTreeMap::new();
+        for (key, value) in env {
+            if let EnvValue::String(value) = value {
+                substitute_params_in_str(value, &empty).map_err(|error| {
+                    eyre::eyre!(
+                        "invalid parameter expression in env key `{key}` of node `{}`: {error}",
+                        node.id
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn substitute_params_in_str(s: &str, params: &BTreeMap<String, String>) -> eyre::Result<String> {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${_param.") {
+        result.push_str(&rest[..start]);
+        let expression = &rest[start..];
+        let end = expression.find('}').ok_or_else(|| {
+            eyre::eyre!(
+                "malformed parameter expression `{expression}`; expected `${{_param.name}}`"
+            )
+        })?;
+        let token = &expression[..=end];
+        let key = &expression[9..end];
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!(
+                "malformed parameter expression `{token}`; parameter names must be non-empty and contain only [A-Za-z0-9_]"
+            );
+        }
+        let value = params.get(key).ok_or_else(|| {
+            eyre::eyre!("module parameter `{key}` is not declared; cannot expand `{token}`")
+        })?;
+        result.push_str(value);
+        rest = &expression[end + 1..];
+    }
+    result.push_str(rest);
+    Ok(result)
 }
 
 /// Rewrite a single input mapping inside a module's inner node.
@@ -1150,6 +1315,115 @@ nodes:
         let expanded = expand_modules(&desc, base).unwrap();
         let names: Vec<_> = expanded.nodes.iter().map(|n| n.id.to_string()).collect();
         assert!(names.contains(&"wrapper.nested.leaf".to_string()));
+    }
+
+    #[test]
+    fn expand_shared_module_root_and_env_param() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        write_file(&shared, "worker.py", "# worker");
+        write_file(
+            &shared,
+            "servo.yml",
+            r#"
+module:
+  name: servo
+  inputs: [tick]
+  outputs: [done]
+nodes:
+  - id: worker
+    path: worker.py
+    inputs:
+      tick: _mod/tick
+    env:
+      SERVO_AUTO_ARM: "${_param.auto_arm}"
+    outputs: [done]
+"#,
+        );
+        let desc = parse_descriptor(
+            r#"
+module_roots:
+  shared: ../shared
+nodes:
+  - id: source
+    path: source.py
+    outputs: [tick]
+  - id: servo
+    module: '@shared/servo.yml'
+    inputs:
+      tick: source/tick
+    params:
+      auto_arm: "true"
+"#,
+        );
+        let expanded = expand_modules(&desc, &project).unwrap();
+        let worker = expanded
+            .nodes
+            .iter()
+            .find(|n| n.id.to_string() == "servo.worker")
+            .unwrap();
+        assert_eq!(
+            worker.env.as_ref().unwrap()["SERVO_AUTO_ARM"],
+            EnvValue::String("true".into())
+        );
+        assert!(Path::new(worker.path.as_ref().unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn reject_shared_root_traversal_and_missing_param() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        write_file(
+            &shared,
+            "m.yml",
+            "module:
+  name: m
+nodes: []",
+        );
+        let traversal = parse_descriptor(
+            "module_roots:
+  shared: ../shared
+nodes:
+  - id: m
+    module: '@shared/../m.yml'
+",
+        );
+        let error = expand_modules(&traversal, &project)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without `..`"), "{error}");
+
+        write_file(&shared, "worker.py", "# worker");
+        write_file(
+            &shared,
+            "param.yml",
+            "module:
+  name: p
+  outputs: [out]
+nodes:
+  - id: worker
+    path: worker.py
+    env:
+      SERVO_AUTO_ARM: '${_param.auto_arm}'
+    outputs: [out]
+",
+        );
+        let missing = parse_descriptor(
+            "module_roots:
+  shared: ../shared
+nodes:
+  - id: p
+    module: '@shared/param.yml'
+",
+        );
+        let error = expand_modules(&missing, &project).unwrap_err().to_string();
+        assert!(error.contains("not declared"), "{error}");
     }
 
     // ---- Feature 3: optional inputs ----

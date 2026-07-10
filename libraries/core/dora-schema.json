@@ -23,6 +23,13 @@
       "format": "double",
       "default": null
     },
+    "module_roots": {
+      "description": "Trusted roots for reusable modules referenced with `@root/path`.\nPaths are resolved relative to this descriptor and canonicalized before use.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "nodes": {
       "description": "List of nodes in the dataflow\n\nThis is the most important field of the dataflow specification.\nEach node must be identified by a unique `id`:\n\n## Example\n\n```yaml\nnodes:\n  - id: foo\n    path: path/to/the/executable\n    # ... (see below)\n  - id: bar\n    path: path/to/another/executable\n    # ... (see below)\n```\n\nFor each node, you need to specify the `path` of the executable or script that Dora should run when starting the node.\nMost of the other node fields are optional, but you typically want to specify at least some `inputs` and/or `outputs`.",
       "type": "array",
